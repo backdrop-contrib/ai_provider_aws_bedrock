@@ -782,7 +782,10 @@ class AIBedrockAdapter extends AIAdapterBase {
         foreach ($msg['tool_calls'] as $tc) {
           $args = $tc['function']['arguments'] ?? ($tc['arguments'] ?? []);
           if (is_string($args)) {
-            $decoded = json_decode($args, TRUE);
+            // Decode without assoc flag so nested {} stay as stdClass objects;
+            // json_decode($s, TRUE) would flatten {} to [] inside associative
+            // arrays, breaking args like {"filters":{}}.
+            $decoded = json_decode($args);
             if ($decoded === NULL && json_last_error() !== JSON_ERROR_NONE) {
               // Malformed model-generated JSON — surface as error state rather
               // than silently coercing to empty input, so callers can detect
@@ -797,11 +800,13 @@ class AIBedrockAdapter extends AIAdapterBase {
               $args = $decoded;
             }
           }
-          // 'input' must serialize as a JSON object. An empty PHP array
-          // encodes as [] and a sequential list encodes as [...] — both
-          // rejected by Bedrock. Cast either case to stdClass so
-          // json_encode always produces {}.
-          if (is_array($args) && $args !== []) {
+          // 'input' must serialize as a JSON object. A stdClass from
+          // json_decode passes through directly. An empty PHP array encodes
+          // as [] and a sequential list as [...] — both rejected by Bedrock.
+          if ($args instanceof \stdClass) {
+            $input = $args;
+          }
+          elseif (is_array($args) && $args !== []) {
             $input = array_values($args) === $args ? (object) $args : $args;
           }
           else {
@@ -1230,6 +1235,14 @@ class AIBedrockAdapter extends AIAdapterBase {
                 watchdog('ai_provider_aws_bedrock', 'Malformed toolUse input JSON from Bedrock for "@tool": @error', [
                   '@tool'  => $block['toolUse']['name'] ?? '',
                   '@error' => json_last_error_msg(),
+                ], WATCHDOG_WARNING);
+                $input = ['_raw_input' => $input];
+              }
+              elseif (!is_array($decoded)) {
+                // Valid JSON but a scalar — (array) casting would produce bogus
+                // positional arguments, so treat it as an error state instead.
+                watchdog('ai_provider_aws_bedrock', 'Unexpected scalar toolUse input from Bedrock for "@tool"', [
+                  '@tool' => $block['toolUse']['name'] ?? '',
                 ], WATCHDOG_WARNING);
                 $input = ['_raw_input' => $input];
               }
