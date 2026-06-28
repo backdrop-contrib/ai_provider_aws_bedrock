@@ -733,6 +733,10 @@ class AIBedrockAdapter extends AIAdapterBase {
         if (!is_string($result_text)) {
           $result_text = json_encode($result_text);
         }
+        // Converse rejects empty text blocks; use a sentinel for empty outputs.
+        if ($result_text === '') {
+          $result_text = '(no output)';
+        }
         $block = [
           'toolResult' => [
             'toolUseId' => (string) ($msg['tool_call_id'] ?? ''),
@@ -768,7 +772,11 @@ class AIBedrockAdapter extends AIAdapterBase {
         }
         elseif (is_array($content)) {
           foreach ($content as $block) {
-            $blocks[] = $this->convertContentBlock($block, $bedrock_role);
+            $converted = $this->convertContentBlock($block, $bedrock_role);
+            if (isset($converted['text']) && $converted['text'] === '') {
+              continue;
+            }
+            $blocks[] = $converted;
           }
         }
         foreach ($msg['tool_calls'] as $tc) {
@@ -779,10 +787,9 @@ class AIBedrockAdapter extends AIAdapterBase {
               // Malformed model-generated JSON — surface as error state rather
               // than silently coercing to empty input, so callers can detect
               // and handle the failure.
-              watchdog('ai_provider_aws_bedrock', 'Malformed tool argument JSON for "@tool": @error — raw: @raw', [
+              watchdog('ai_provider_aws_bedrock', 'Malformed tool argument JSON for "@tool": @error', [
                 '@tool'  => $tc['function']['name'] ?? ($tc['name'] ?? ''),
                 '@error' => json_last_error_msg(),
-                '@raw'   => $args,
               ], WATCHDOG_WARNING);
               $args = ['_raw_args' => $args];
             }
@@ -820,7 +827,11 @@ class AIBedrockAdapter extends AIAdapterBase {
       elseif (is_array($content)) {
         $blocks = [];
         foreach ($content as $block) {
-          $blocks[] = $this->convertContentBlock($block, $bedrock_role);
+          $converted = $this->convertContentBlock($block, $bedrock_role);
+          if (isset($converted['text']) && $converted['text'] === '') {
+            continue;
+          }
+          $blocks[] = $converted;
         }
         if ($blocks === []) {
           continue;
