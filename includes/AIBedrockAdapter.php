@@ -436,7 +436,7 @@ class AIBedrockAdapter extends AIAdapterBase {
         'messages'        => $bedrock_messages,
         'inferenceConfig' => [
           'maxTokens'   => (int) $max_tokens ?: 1024,
-          'temperature' => (float) $temperature,
+          'temperature' => max(0.0, min(1.0, (float) $temperature)),
         ],
       ];
 
@@ -725,13 +725,77 @@ class AIBedrockAdapter extends AIAdapterBase {
         continue;
       }
 
+      // OpenAI-shape tool results become toolResult blocks in a user turn.
+      // Consecutive results merge into one turn: Converse requires roles to
+      // alternate, and all results for one assistant turn belong together.
+      if ($role === 'tool') {
+        $result_text = $msg['content'] ?? '';
+        if (!is_string($result_text)) {
+          $result_text = json_encode($result_text);
+        }
+        $block = [
+          'toolResult' => [
+            'toolUseId' => (string) ($msg['tool_call_id'] ?? ''),
+            'content'   => [['text' => $result_text]],
+          ],
+        ];
+        $last = count($bedrock_messages) - 1;
+        if ($last >= 0
+          && $bedrock_messages[$last]['role'] === 'user'
+          && isset($bedrock_messages[$last]['content'][0]['toolResult'])) {
+          $bedrock_messages[$last]['content'][] = $block;
+        }
+        else {
+          $bedrock_messages[] = ['role' => 'user', 'content' => [$block]];
+        }
+        continue;
+      }
+
       // Bedrock Converse API supports 'user' and 'assistant' roles.
       $bedrock_role = ($role === 'assistant') ? 'assistant' : 'user';
 
       $content = $msg['content'] ?? '';
 
-      // Content can be a string or an array of content blocks.
+      // OpenAI-shape assistant tool_calls become toolUse blocks. Without
+      // this the calls were dropped and a text-less assistant turn became
+      // an empty text block, which Converse rejects.
+      if ($bedrock_role === 'assistant' && !empty($msg['tool_calls']) && is_array($msg['tool_calls'])) {
+        $blocks = [];
+        if (is_string($content)) {
+          if (trim($content) !== '') {
+            $blocks[] = ['text' => $content];
+          }
+        }
+        elseif (is_array($content)) {
+          foreach ($content as $block) {
+            $blocks[] = $this->convertContentBlock($block, $bedrock_role);
+          }
+        }
+        foreach ($msg['tool_calls'] as $tc) {
+          $args = $tc['function']['arguments'] ?? ($tc['arguments'] ?? []);
+          if (is_string($args)) {
+            $args = json_decode($args, TRUE);
+          }
+          // 'input' must serialize as a JSON object — an empty PHP array
+          // would encode as [] and be rejected.
+          $blocks[] = [
+            'toolUse' => [
+              'toolUseId' => (string) ($tc['id'] ?? ''),
+              'name'      => (string) ($tc['function']['name'] ?? ($tc['name'] ?? '')),
+              'input'     => is_array($args) && $args !== [] ? $args : (object) [],
+            ],
+          ];
+        }
+        $bedrock_messages[] = ['role' => 'assistant', 'content' => $blocks];
+        continue;
+      }
+
+      // Content can be a string or an array of content blocks. Converse
+      // rejects empty content; skip empty turns.
       if (is_string($content)) {
+        if (trim($content) === '') {
+          continue;
+        }
         $bedrock_messages[] = [
           'role'    => $bedrock_role,
           'content' => [
@@ -743,6 +807,9 @@ class AIBedrockAdapter extends AIAdapterBase {
         $blocks = [];
         foreach ($content as $block) {
           $blocks[] = $this->convertContentBlock($block, $bedrock_role);
+        }
+        if ($blocks === []) {
+          continue;
         }
         $bedrock_messages[] = [
           'role'    => $bedrock_role,
@@ -991,7 +1058,11 @@ class AIBedrockAdapter extends AIAdapterBase {
           : json_encode(
             $msg['content']
           );
-        $system[] = ['text' => trim($text)];
+        $text = trim($text);
+        // Converse rejects empty text blocks.
+        if ($text !== '') {
+          $system[] = ['text' => $text];
+        }
       }
     }
     return $system;
@@ -1053,7 +1124,7 @@ class AIBedrockAdapter extends AIAdapterBase {
         'messages'        => $bedrock_messages,
         'inferenceConfig' => [
           'maxTokens'   => (int) $max_tokens ?: 1024,
-          'temperature' => (float) $temperature,
+          'temperature' => max(0.0, min(1.0, (float) $temperature)),
         ],
       ];
 
@@ -1114,10 +1185,17 @@ class AIBedrockAdapter extends AIAdapterBase {
             $content .= $block['text'];
           }
           if (isset($block['toolUse'])) {
+            // Callers (ai_agents) require 'arguments' to be an array — a
+            // JSON string fails their is_array() check and the tool runs
+            // with no arguments.
+            $input = $block['toolUse']['input'] ?? [];
+            if (is_string($input)) {
+              $input = json_decode($input, TRUE) ?? [];
+            }
             $tool_calls[] = [
               'id'        => $block['toolUse']['toolUseId'],
               'name'      => $block['toolUse']['name'],
-              'arguments' => json_encode($block['toolUse']['input']),
+              'arguments' => is_array($input) ? $input : (array) $input,
             ];
           }
         }
