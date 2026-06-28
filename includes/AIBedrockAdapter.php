@@ -774,7 +774,21 @@ class AIBedrockAdapter extends AIAdapterBase {
         foreach ($msg['tool_calls'] as $tc) {
           $args = $tc['function']['arguments'] ?? ($tc['arguments'] ?? []);
           if (is_string($args)) {
-            $args = json_decode($args, TRUE);
+            $decoded = json_decode($args, TRUE);
+            if ($decoded === NULL && json_last_error() !== JSON_ERROR_NONE) {
+              // Malformed model-generated JSON — surface as error state rather
+              // than silently coercing to empty input, so callers can detect
+              // and handle the failure.
+              watchdog('ai_provider_aws_bedrock', 'Malformed tool argument JSON for "@tool": @error — raw: @raw', [
+                '@tool'  => $tc['function']['name'] ?? ($tc['name'] ?? ''),
+                '@error' => json_last_error_msg(),
+                '@raw'   => $args,
+              ], WATCHDOG_WARNING);
+              $args = ['_raw_args' => $args];
+            }
+            else {
+              $args = $decoded;
+            }
           }
           // 'input' must serialize as a JSON object — an empty PHP array
           // would encode as [] and be rejected.
@@ -1190,7 +1204,19 @@ class AIBedrockAdapter extends AIAdapterBase {
             // with no arguments.
             $input = $block['toolUse']['input'] ?? [];
             if (is_string($input)) {
-              $input = json_decode($input, TRUE) ?? [];
+              $decoded = json_decode($input, TRUE);
+              if ($decoded === NULL && json_last_error() !== JSON_ERROR_NONE) {
+                // Malformed JSON from Bedrock — preserve raw value as error
+                // state rather than silently coercing to an empty array.
+                watchdog('ai_provider_aws_bedrock', 'Malformed toolUse input JSON from Bedrock for "@tool": @error', [
+                  '@tool'  => $block['toolUse']['name'] ?? '',
+                  '@error' => json_last_error_msg(),
+                ], WATCHDOG_WARNING);
+                $input = ['_raw_input' => $input];
+              }
+              else {
+                $input = $decoded;
+              }
             }
             $tool_calls[] = [
               'id'        => $block['toolUse']['toolUseId'],
