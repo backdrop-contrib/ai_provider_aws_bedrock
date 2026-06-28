@@ -797,13 +797,21 @@ class AIBedrockAdapter extends AIAdapterBase {
               $args = $decoded;
             }
           }
-          // 'input' must serialize as a JSON object — an empty PHP array
-          // would encode as [] and be rejected.
+          // 'input' must serialize as a JSON object. An empty PHP array
+          // encodes as [] and a sequential list encodes as [...] — both
+          // rejected by Bedrock. Cast either case to stdClass so
+          // json_encode always produces {}.
+          if (is_array($args) && $args !== []) {
+            $input = array_values($args) === $args ? (object) $args : $args;
+          }
+          else {
+            $input = (object) [];
+          }
           $blocks[] = [
             'toolUse' => [
               'toolUseId' => (string) ($tc['id'] ?? ''),
               'name'      => (string) ($tc['function']['name'] ?? ($tc['name'] ?? '')),
-              'input'     => is_array($args) && $args !== [] ? $args : (object) [],
+              'input'     => $input,
             ],
           ];
         }
