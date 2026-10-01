@@ -15,6 +15,12 @@
  */
 class AIBedrockAdapter extends AIAdapterBase {
 
+  /** @var array Foundation model modality metadata, indexed by model ID. */
+  protected $modelMetadata = [];
+
+  /** @var array|null Catalog reused alongside foundation-model metadata. */
+  protected $models;
+
   /**
    * AWS Access Key ID (mirrors $this->apiKey from base).
    *
@@ -180,6 +186,9 @@ class AIBedrockAdapter extends AIAdapterBase {
    *    rerank, etc.).
    */
   public function getModels(): array {
+    if ($this->models !== NULL) {
+      return $this->models;
+    }
     try {
       $client = $this->getBedrockClient();
       $models = [];
@@ -241,6 +250,9 @@ class AIBedrockAdapter extends AIAdapterBase {
       $result = $client->listFoundationModels([]);
       if (!empty($result['modelSummaries'])) {
         foreach ($result['modelSummaries'] as $model) {
+          if (!empty($model['modelId'])) {
+            $this->modelMetadata[$model['modelId']] = $model;
+          }
           // Skip non-active models.
           if (isset($model['modelLifecycle']['status'])
             && $model['modelLifecycle']['status'] !== 'ACTIVE'
@@ -274,7 +286,7 @@ class AIBedrockAdapter extends AIAdapterBase {
 
       if (!empty($models)) {
         asort($models);
-        return $models;
+        return $this->models = $models;
       }
     }
     catch (\Exception $e) {
@@ -287,7 +299,7 @@ class AIBedrockAdapter extends AIAdapterBase {
     }
 
     // Return a curated fallback list if the API call fails.
-    return $this->getFallbackModels();
+    return $this->models = $this->getFallbackModels();
   }
 
   /**
@@ -342,25 +354,46 @@ class AIBedrockAdapter extends AIAdapterBase {
   public function getModelsByCapability($capability): array {
     $models = $this->getModels();
     $filtered = [];
+    $capability = ai_normalize_capability_name($capability);
 
     foreach ($models as $id => $label) {
       $is_match = FALSE;
+      $base_id = preg_replace('/^(us|eu|ap|global)\./', '', $id);
+      $metadata = $this->modelMetadata[$base_id] ?? [];
+      $input = (array) ($metadata['inputModalities'] ?? []);
+      $output = (array) ($metadata['outputModalities'] ?? []);
 
       switch ($capability) {
         case 'text':
-          $is_match = strpos($id, 'embed') === FALSE && strpos($id, 'rerank') === FALSE;
+          $is_match = $output ? in_array('TEXT', $output, TRUE) : strpos($id, 'embed') === FALSE && strpos($id, 'rerank') === FALSE;
           break;
 
         case 'embedding':
         case 'embeddings':
-          $is_match = strpos($id, 'embed') !== FALSE;
+          $is_match = $output ? in_array('EMBEDDING', $output, TRUE) : strpos($id, 'embed') !== FALSE;
           break;
 
         case 'vision':
+          if ($input && $output) {
+            $is_match = in_array('IMAGE', $input, TRUE) && in_array('TEXT', $output, TRUE);
+            break;
+          }
           $is_match = (bool) preg_match(
-            '/anthropic\.claude-3|anthropic\.claude-4|meta\.llama3.*vision|amazon\.nova-.*(pro|lite|sonic)|google\.gemma-3/i',
+            '/anthropic\.claude-3|anthropic\.claude-(?:sonnet|opus|haiku)-[4-9]|meta\.llama3.*vision|amazon\.nova-.*(pro|lite|sonic)|google\.gemma-3/i',
             $id
           );
+          break;
+
+        case 'tool_calling':
+          $is_match = (bool) preg_match(
+            '/anthropic\.claude-(?:3|(?:sonnet|opus|haiku)-[4-9])|amazon\.nova|meta\.llama3|mistral\.(?:large|small)/i',
+            $id
+          );
+          break;
+
+        case 'thinking':
+          // thinking_budget is sent in Anthropic's format, so Claude only.
+          $is_match = (bool) preg_match('/anthropic\.claude-(?:3-7|(?:sonnet|opus|haiku)-[4-9])/i', $id);
           break;
 
         case 'image':
@@ -442,6 +475,20 @@ class AIBedrockAdapter extends AIAdapterBase {
 
       if (!empty($system_messages)) {
         $payload['system'] = $system_messages;
+      }
+
+      if (!empty($context_extra['thinking_budget'])) {
+        $budget = max(1024, (int) $context_extra['thinking_budget']);
+        $payload['additionalModelRequestFields']['thinking'] = [
+          'type' => 'enabled',
+          'budget_tokens' => $budget,
+        ];
+        // Claude rejects extended thinking unless temperature is 1 and
+        // maxTokens leaves room for the answer beyond the budget.
+        $payload['inferenceConfig']['temperature'] = 1.0;
+        if ($payload['inferenceConfig']['maxTokens'] <= $budget) {
+          $payload['inferenceConfig']['maxTokens'] = $budget + 1024;
+        }
       }
 
       if ($stream_response) {
@@ -1168,6 +1215,20 @@ class AIBedrockAdapter extends AIAdapterBase {
 
       if (!empty($system_messages)) {
         $payload['system'] = $system_messages;
+      }
+
+      if (!empty($context_extra['thinking_budget'])) {
+        $budget = max(1024, (int) $context_extra['thinking_budget']);
+        $payload['additionalModelRequestFields']['thinking'] = [
+          'type' => 'enabled',
+          'budget_tokens' => $budget,
+        ];
+        // Claude rejects extended thinking unless temperature is 1 and
+        // maxTokens leaves room for the answer beyond the budget.
+        $payload['inferenceConfig']['temperature'] = 1.0;
+        if ($payload['inferenceConfig']['maxTokens'] <= $budget) {
+          $payload['inferenceConfig']['maxTokens'] = $budget + 1024;
+        }
       }
 
       // Convert shared tools to Bedrock toolConfig.
