@@ -492,46 +492,17 @@ class AIBedrockAdapter extends AIAdapterBase {
       }
 
       if ($stream_response) {
-        // Also apply inference profile resolution for streaming.
-        try {
-          return $this->handleStreamingResponse($payload);
-        }
-        catch (\Exception $e) {
-          $needs_profile = strpos($e->getMessage(), 'on-demand throughput isn\'t supported') !== FALSE;
-          $lacks_prefix = !preg_match('/^(us|eu|ap)\./', $model);
-          if ($needs_profile && $lacks_prefix) {
-            $payload['modelId'] = $this->resolveInferenceProfileId($model);
+        // converseStream() raises request errors before any event is read,
+        // so the same retries apply to streaming.
+        return $this->sendDroppingRejectedParams($model, $payload, function (array $payload) use ($model) {
+          return $this->withInferenceProfileRetry($model, $payload, function (array $payload) {
             return $this->handleStreamingResponse($payload);
-          }
-          throw $e;
-        }
+          });
+        });
       }
 
       $client = $this->getRuntimeClient();
-
-      try {
-        $response = $client->converse($payload);
-      }
-      catch (\Exception $e) {
-        // If the model requires an inference profile, retry with the
-        // region-prefixed inference profile ID.
-        $needs_profile = strpos($e->getMessage(), 'on-demand throughput isn\'t supported') !== FALSE;
-        $lacks_prefix = !preg_match('/^(us|eu|ap)\./', $model);
-        if ($needs_profile && $lacks_prefix) {
-          $profile_id = $this->resolveInferenceProfileId($model);
-          watchdog(
-            'ai_provider_aws_bedrock',
-            'Model @model requires inference profile, retrying with @profile.',
-            ['@model' => $model, '@profile' => $profile_id],
-            WATCHDOG_INFO
-          );
-          $payload['modelId'] = $profile_id;
-          $response = $client->converse($payload);
-        }
-        else {
-          throw $e;
-        }
-      }
+      $response = $this->converse($client, $model, $payload);
 
       // Extract text from the Converse API response.
       $text = '';
@@ -702,6 +673,52 @@ class AIBedrockAdapter extends AIAdapterBase {
         );
       }
       throw $e;
+    }
+  }
+
+  /**
+   * {@inheritdoc}
+   *
+   * Converse takes sampling params under inferenceConfig. Newer Claude and
+   * OpenAI models on Bedrock refuse temperature.
+   */
+  protected function optionalParams(): array {
+    return ['inferenceConfig.temperature', 'inferenceConfig.topP'];
+  }
+
+  /**
+   * Call Converse, dropping rejected params and resolving inference profiles.
+   */
+  protected function converse($client, string $model, array $payload) {
+    return $this->sendDroppingRejectedParams($model, $payload, function (array $payload) use ($client, $model) {
+      return $this->withInferenceProfileRetry($model, $payload, function (array $payload) use ($client) {
+        return $client->converse($payload);
+      });
+    });
+  }
+
+  /**
+   * Retry with the region-prefixed inference profile when a model needs one.
+   */
+  protected function withInferenceProfileRetry(string $model, array $payload, callable $send) {
+    try {
+      return $send($payload);
+    }
+    catch (\Exception $e) {
+      $needs_profile = strpos($e->getMessage(), 'on-demand throughput isn\'t supported') !== FALSE;
+      $lacks_prefix = !preg_match('/^(us|eu|ap)\./', $model);
+      if (!$needs_profile || !$lacks_prefix) {
+        throw $e;
+      }
+      $profile_id = $this->resolveInferenceProfileId($model);
+      watchdog(
+        'ai_provider_aws_bedrock',
+        'Model @model requires inference profile, retrying with @profile.',
+        ['@model' => $model, '@profile' => $profile_id],
+        WATCHDOG_INFO
+      );
+      $payload['modelId'] = $profile_id;
+      return $send($payload);
     }
   }
 
@@ -1261,20 +1278,7 @@ class AIBedrockAdapter extends AIAdapterBase {
       }
 
       $client = $this->getRuntimeClient();
-      try {
-        $response = $client->converse($payload);
-      }
-      catch (\Exception $e) {
-        $needs_profile = strpos($e->getMessage(), 'on-demand throughput isn\'t supported') !== FALSE;
-        $lacks_prefix = !preg_match('/^(us|eu|ap)\./', $model);
-        if ($needs_profile && $lacks_prefix) {
-          $payload['modelId'] = $this->resolveInferenceProfileId($model);
-          $response = $client->converse($payload);
-        }
-        else {
-          throw $e;
-        }
-      }
+      $response = $this->converse($client, $model, $payload);
 
       $content = '';
       $tool_calls = [];
