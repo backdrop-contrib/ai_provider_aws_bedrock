@@ -997,125 +997,28 @@ class AIBedrockAdapter extends AIAdapterBase {
   /**
    * Load image bytes and format for Bedrock image inputs.
    *
+   * Uses AIImageHelper::loadInputImage(), which accepts data URLs, this
+   * site's files and public https URLs only, so a message cannot make the
+   * server read local files or fetch internal addresses.
+   *
    * @param string $source
-   *   The image source. Supports data URIs, local paths, and HTTP(S) URLs.
+   *   The image source.
    *
    * @return array
    *   Array with keys 'bytes' and 'format'.
    */
   protected function loadImageBytes(string $source): array {
-    if (strpos($source, 'data:image/') === 0) {
-      return $this->decodeDataUriImage($source);
+    try {
+      $image = AIImageHelper::loadInputImage($source);
     }
-
-    if (preg_match('#^https?://#i', $source)) {
-      $response = backdrop_http_request($source, [
-        'method' => 'GET',
-        'timeout' => 15,
-        'headers' => [
-          'Accept' => 'image/*',
-        ],
-      ]);
-
-      if (empty($response->data) || !isset($response->code) || (int) $response->code !== 200) {
-        throw new \Exception('Unable to download the image URL for AWS Bedrock input.');
-      }
-
-      return [
-        'bytes' => $response->data,
-        'format' => $this->detectImageFormat($source, $this->extractContentType($response)),
-      ];
-    }
-
-    $bytes = @file_get_contents($source);
-    if ($bytes === FALSE || $bytes === '') {
-      throw new \Exception('Unable to read the image source for AWS Bedrock input.');
+    catch (\InvalidArgumentException $e) {
+      throw new \Exception('AWS Bedrock image input refused: ' . $e->getMessage());
     }
 
     return [
-      'bytes' => $bytes,
-      'format' => $this->detectImageFormat($source),
+      'bytes' => $image['data'],
+      'format' => $this->normalizeImageFormat(substr($image['mime'], strlen('image/'))),
     ];
-  }
-
-  /**
-   * Decode a base64 data URI into bytes and a Bedrock-compatible format.
-   *
-   * @param string $source
-   *   The data URI source.
-   *
-   * @return array
-   *   Array with keys 'bytes' and 'format'.
-   */
-  protected function decodeDataUriImage(string $source): array {
-    if (!preg_match('#^data:image/([a-zA-Z0-9.+-]+);base64,(.+)$#s', $source, $matches)) {
-      throw new \Exception('Invalid image data URI supplied to AWS Bedrock.');
-    }
-
-    $bytes = base64_decode($matches[2], TRUE);
-    if ($bytes === FALSE) {
-      throw new \Exception('Invalid base64 image data supplied to AWS Bedrock.');
-    }
-
-    return [
-      'bytes' => $bytes,
-      'format' => $this->normalizeImageFormat($matches[1]),
-    ];
-  }
-
-  /**
-   * Extract the content type header from a Backdrop HTTP response object.
-   *
-   * @param object $response
-   *   The Backdrop HTTP response object.
-   *
-   * @return string
-   *   The content type, if available.
-   */
-  protected function extractContentType($response): string {
-    if (empty($response->headers) || !is_array($response->headers)) {
-      return '';
-    }
-
-    foreach ($response->headers as $name => $value) {
-      if (strtolower($name) !== 'content-type') {
-        continue;
-      }
-
-      if (is_array($value)) {
-        return (string) reset($value);
-      }
-
-      return (string) $value;
-    }
-
-    return '';
-  }
-
-  /**
-   * Detect the image format Bedrock expects for an image source.
-   *
-   * @param string $source
-   *   The image source.
-   * @param string $content_type
-   *   Optional content type header.
-   *
-   * @return string
-   *   A normalized Bedrock image format.
-   */
-  protected function detectImageFormat(string $source, string $content_type = ''): string {
-    if ($content_type !== '') {
-      if (preg_match('#image/([a-zA-Z0-9.+-]+)#i', $content_type, $matches)) {
-        return $this->normalizeImageFormat($matches[1]);
-      }
-    }
-
-    $path = parse_url($source, PHP_URL_PATH);
-    if (!is_string($path) || $path === '') {
-      $path = $source;
-    }
-
-    return $this->normalizeImageFormat(pathinfo($path, PATHINFO_EXTENSION));
   }
 
   /**
