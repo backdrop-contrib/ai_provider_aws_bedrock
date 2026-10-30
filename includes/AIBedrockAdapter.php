@@ -4,8 +4,11 @@
  * @file
  * AWS Bedrock adapter for the AI module.
  *
- * This adapter implements AIProviderClient using the AWS SDK for PHP,
- * translating shared chat-style method calls to AWS Bedrock's Converse API.
+ * This adapter implements AIProviderClient on the AWS Connect module (SigV4
+ * signing and transport), translating shared chat-style method calls to AWS
+ * Bedrock's Converse API. Until AWS Connect is enabled it falls back to the
+ * bundled AWS SDK for PHP, which is deprecated and removed in the next major
+ * release.
  *
  * Supports chat via the Converse API and embeddings via InvokeModel.
  * Models available through Bedrock include Anthropic Claude, Meta Llama,
@@ -43,14 +46,26 @@ class AIBedrockAdapter extends AIAdapterBase {
   protected $region;
 
   /**
-   * The Bedrock Runtime client.
+   * Generation request timeout in seconds; long Claude answers take minutes.
+   */
+  const GENERATION_TIMEOUT = 300;
+
+  /**
+   * The signed AWS client. Bedrock and Bedrock Runtime share one signing name.
+   *
+   * @var AwsConnectClient|null
+   */
+  protected $client = NULL;
+
+  /**
+   * The Bedrock Runtime SDK client (deprecated fallback).
    *
    * @var \Aws\BedrockRuntime\BedrockRuntimeClient|null
    */
   protected $runtimeClient = NULL;
 
   /**
-   * The Bedrock client (for listing models).
+   * The Bedrock SDK client for listing models (deprecated fallback).
    *
    * @var \Aws\Bedrock\BedrockClient|null
    */
@@ -91,15 +106,23 @@ class AIBedrockAdapter extends AIAdapterBase {
     $this->region = ai_get_provider_setting('aws_bedrock', 'aws_region')
       ?: ($legacy_region ?: 'us-east-1');
 
-    // Ensure the AWS SDK autoloader is available.
-    $this->loadAwsSdk();
+    if (!$this->useAwsConnect()) {
+      $this->loadAwsSdk();
+    }
+  }
+
+  /**
+   * Whether requests go through AWS Connect rather than the bundled SDK.
+   */
+  protected function useAwsConnect(): bool {
+    return module_exists('aws_connect');
   }
 
   /**
    * {@inheritdoc}
    *
-   * Bedrock uses the AWS SDK (SigV4 signing), not backdrop_http_request.
-   * Return empty headers; SDK handles auth.
+   * Bedrock requests are SigV4-signed by AwsConnectClient, not
+   * backdrop_http_request. Return empty headers; the client handles auth.
    */
   protected function getDefaultHeaders(): array {
     return [];
@@ -110,6 +133,8 @@ class AIBedrockAdapter extends AIAdapterBase {
    *
    * Prefers Composer Manager's global autoloader if available, then falls back
    * to the vendor directory bundled with this module.
+   *
+   * @deprecated Enable the AWS Connect module instead.
    */
   protected function loadAwsSdk() {
     if (class_exists('Aws\\Sdk')) {
@@ -130,7 +155,7 @@ class AIBedrockAdapter extends AIAdapterBase {
     }
 
     throw new \Exception(
-      'AWS SDK not found. Run "composer install" in the ai_provider_aws_bedrock module directory, or enable the Composer Manager module.'
+      'AWS Bedrock needs the AWS Connect module. Add and enable AWS Connect; the bundled AWS SDK fallback is deprecated.'
     );
   }
 
@@ -175,6 +200,150 @@ class AIBedrockAdapter extends AIAdapterBase {
   }
 
   /**
+   * Get the signed AWS client.
+   *
+   * @return AwsConnectClient
+   *   The client, signing as the "bedrock" service in the configured region.
+   */
+  protected function getClient(): AwsConnectClient {
+    if (!$this->client) {
+      $this->client = aws_connect_client('bedrock', $this->region,
+        AwsConnectCredentialProvider::fromKeys($this->accessKeyId, $this->secretAccessKey));
+    }
+    return $this->client;
+  }
+
+  /**
+   * Build a Bedrock control-plane URL (model and profile listings).
+   */
+  protected function controlUrl(string $path): string {
+    return 'https://bedrock.' . $this->region . '.amazonaws.com' . $path;
+  }
+
+  /**
+   * Build a Bedrock Runtime URL for a model operation.
+   *
+   * @param string $model_id
+   *   The model or inference profile ID.
+   * @param string $operation
+   *   The operation: converse, converse-stream or invoke.
+   */
+  protected function runtimeUrl(string $model_id, string $operation): string {
+    return 'https://bedrock-runtime.' . $this->region . '.amazonaws.com/model/'
+      . rawurlencode($model_id) . '/' . $operation;
+  }
+
+  /**
+   * Convert an SDK-shaped Converse payload to a REST request body.
+   *
+   * The model ID moves into the URL, and image bytes are base64-encoded as the
+   * JSON protocol requires (the SDK did this for blob fields).
+   *
+   * @return array
+   *   The model ID and the request body.
+   */
+  protected function converseRequest(array $payload): array {
+    $model_id = $payload['modelId'];
+    unset($payload['modelId']);
+    foreach ($payload['messages'] ?? [] as $i => $message) {
+      foreach ($message['content'] ?? [] as $j => $block) {
+        if (isset($block['image']['source']['bytes'])) {
+          $payload['messages'][$i]['content'][$j]['image']['source']['bytes'] = base64_encode($block['image']['source']['bytes']);
+        }
+      }
+    }
+    return [$model_id, $payload];
+  }
+
+  /**
+   * List inference profiles (ListInferenceProfiles).
+   */
+  protected function listInferenceProfiles(): array {
+    if ($this->useAwsConnect()) {
+      return $this->getClient()->request('GET', $this->controlUrl('/inference-profiles'))->json();
+    }
+    return $this->getBedrockClient()->listInferenceProfiles([])->toArray();
+  }
+
+  /**
+   * List foundation models (ListFoundationModels).
+   */
+  protected function listFoundationModels(): array {
+    if ($this->useAwsConnect()) {
+      return $this->getClient()->request('GET', $this->controlUrl('/foundation-models'))->json();
+    }
+    return $this->getBedrockClient()->listFoundationModels([])->toArray();
+  }
+
+  /**
+   * Send one Converse request.
+   *
+   * @param array $payload
+   *   The SDK-shaped Converse payload, including modelId.
+   */
+  protected function converseCall(array $payload): array {
+    if ($this->useAwsConnect()) {
+      [$model_id, $body] = $this->converseRequest($payload);
+      return $this->getClient()->request('POST', $this->runtimeUrl($model_id, 'converse'), [
+        'json' => $body,
+        'timeout' => self::GENERATION_TIMEOUT,
+      ])->json();
+    }
+    // The SDK validates toolChoice.any as an array, not a JSON object.
+    if (isset($payload['toolConfig']['toolChoice']['any'])) {
+      $payload['toolConfig']['toolChoice']['any'] = [];
+    }
+    return $this->getRuntimeClient()->converse($payload)->toArray();
+  }
+
+  /**
+   * Send one ConverseStream request, passing each text delta to a callback.
+   *
+   * @param array $payload
+   *   The SDK-shaped Converse payload, including modelId.
+   * @param callable $on_text
+   *   Called with each text delta.
+   */
+  protected function converseStreamCall(array $payload, callable $on_text): void {
+    if ($this->useAwsConnect()) {
+      [$model_id, $body] = $this->converseRequest($payload);
+      $this->getClient()->requestEventStream('POST', $this->runtimeUrl($model_id, 'converse-stream'), [
+        'json' => $body,
+        'timeout' => self::GENERATION_TIMEOUT,
+      ], function ($event_type, $event) use ($on_text) {
+        if ($event_type === 'contentBlockDelta' && isset($event['delta']['text'])) {
+          $on_text($event['delta']['text']);
+        }
+      });
+      return;
+    }
+    foreach ($this->getRuntimeClient()->converseStream($payload)->get('stream') as $event) {
+      if (isset($event['contentBlockDelta']['delta']['text'])) {
+        $on_text($event['contentBlockDelta']['delta']['text']);
+      }
+    }
+  }
+
+  /**
+   * Send one InvokeModel request with a JSON body and decode the response.
+   */
+  protected function invokeModelCall(string $model_id, array $payload): array {
+    if ($this->useAwsConnect()) {
+      return $this->getClient()->request('POST', $this->runtimeUrl($model_id, 'invoke'), [
+        'json' => $payload,
+        'headers' => ['Accept' => 'application/json'],
+        'timeout' => self::GENERATION_TIMEOUT,
+      ])->json();
+    }
+    $response = $this->getRuntimeClient()->invokeModel([
+      'modelId'     => $model_id,
+      'body'        => json_encode($payload),
+      'contentType' => 'application/json',
+    ]);
+    return json_decode((string) $response['body'], TRUE) ?: [];
+  }
+
+  /**
    * {@inheritdoc}
    *
    * Builds the model list using a two-pass strategy:
@@ -190,7 +359,6 @@ class AIBedrockAdapter extends AIAdapterBase {
       return $this->models;
     }
     try {
-      $client = $this->getBedrockClient();
       $models = [];
 
       // Track which base model IDs are covered by inference profiles so we
@@ -202,7 +370,7 @@ class AIBedrockAdapter extends AIAdapterBase {
       // 'global.' profiles.
       try {
         $region_prefix = $this->getRegionPrefix();
-        $profiles_result = $client->listInferenceProfiles([]);
+        $profiles_result = $this->listInferenceProfiles();
         if (!empty($profiles_result['inferenceProfileSummaries'])) {
           foreach ($profiles_result['inferenceProfileSummaries'] as $profile) {
             if (($profile['status'] ?? '') !== 'ACTIVE') {
@@ -247,7 +415,7 @@ class AIBedrockAdapter extends AIAdapterBase {
       }
 
       // ---- Pass 2: Foundation models (fill gaps) ----
-      $result = $client->listFoundationModels([]);
+      $result = $this->listFoundationModels();
       if (!empty($result['modelSummaries'])) {
         foreach ($result['modelSummaries'] as $model) {
           if (!empty($model['modelId'])) {
@@ -492,17 +660,10 @@ class AIBedrockAdapter extends AIAdapterBase {
       }
 
       if ($stream_response) {
-        // converseStream() raises request errors before any event is read,
-        // so the same retries apply to streaming.
-        return $this->sendDroppingRejectedParams($model, $payload, function (array $payload) use ($model) {
-          return $this->withInferenceProfileRetry($model, $payload, function (array $payload) {
-            return $this->handleStreamingResponse($payload);
-          });
-        });
+        return $this->handleStreamingResponse($model, $payload);
       }
 
-      $client = $this->getRuntimeClient();
-      $response = $this->converse($client, $model, $payload);
+      $response = $this->converse($model, $payload);
 
       // Extract text from the Converse API response.
       $text = '';
@@ -612,8 +773,6 @@ class AIBedrockAdapter extends AIAdapterBase {
     bool $log = TRUE
   ): array {
     try {
-      $client = $this->getRuntimeClient();
-
       // Build the payload based on the model type.
       if (strpos($model, 'amazon.titan-embed') === 0) {
         $payload = ['inputText' => $input];
@@ -629,29 +788,21 @@ class AIBedrockAdapter extends AIAdapterBase {
         $payload = ['inputText' => $input];
       }
 
-      $invoke_params = [
-        'modelId'     => $model,
-        'body'        => json_encode($payload),
-        'contentType' => 'application/json',
-      ];
-
       try {
-        $response = $client->invokeModel($invoke_params);
+        $body = $this->invokeModelCall($model, $payload);
       }
       catch (\Exception $e) {
         // Retry with inference profile ID if on-demand isn't supported.
         $needs_profile = strpos($e->getMessage(), 'on-demand throughput isn\'t supported') !== FALSE;
         $lacks_prefix = !preg_match('/^(us|eu|ap)\./', $model);
         if ($needs_profile && $lacks_prefix) {
-          $invoke_params['modelId'] = $this->resolveInferenceProfileId($model);
-          $response = $client->invokeModel($invoke_params);
+          $body = $this->invokeModelCall($this->resolveInferenceProfileId($model), $payload);
         }
         else {
           throw $e;
         }
       }
 
-      $body = json_decode((string) $response['body'], TRUE);
 
       // Extract embeddings based on model type.
       if (strpos($model, 'amazon.titan-embed') === 0) {
@@ -689,10 +840,10 @@ class AIBedrockAdapter extends AIAdapterBase {
   /**
    * Call Converse, dropping rejected params and resolving inference profiles.
    */
-  protected function converse($client, string $model, array $payload) {
-    return $this->sendDroppingRejectedParams($model, $payload, function (array $payload) use ($client, $model) {
-      return $this->withInferenceProfileRetry($model, $payload, function (array $payload) use ($client) {
-        return $client->converse($payload);
+  protected function converse(string $model, array $payload): array {
+    return $this->sendDroppingRejectedParams($model, $payload, function (array $payload) use ($model) {
+      return $this->withInferenceProfileRetry($model, $payload, function (array $payload) {
+        return $this->converseCall($payload);
       });
     });
   }
@@ -725,48 +876,50 @@ class AIBedrockAdapter extends AIAdapterBase {
   /**
    * Handle streaming responses via the Converse Stream API.
    *
+   * @param string $model
+   *   The requested model ID.
    * @param array $payload
    *   The Converse API payload.
    *
    * @return object
-   *   A streaming response object.
+   *   A streaming response object. Its send() method makes the request and
+   *   echoes text deltas as they arrive.
    */
-  protected function handleStreamingResponse(array $payload) {
-    try {
-      $client = $this->getRuntimeClient();
-      $response = $client->converseStream($payload);
+  protected function handleStreamingResponse(string $model, array $payload) {
+    // HTTP errors arrive before any event is read, so the same retries as
+    // converse() apply to streaming.
+    $stream = function () use ($model, $payload) {
+      $this->sendDroppingRejectedParams($model, $payload, function (array $payload) use ($model) {
+        return $this->withInferenceProfileRetry($model, $payload, function (array $payload) {
+          $this->converseStreamCall($payload, function (string $text) {
+            echo $text;
+            @ob_flush();
+            @flush();
+          });
+        });
+      });
+    };
 
-      $stream = $response->get('stream');
+    return new class($stream) {
 
-      return new class($stream) {
+      public function __construct(protected \Closure $stream) {}
 
-        protected $stream;
-
-        public function __construct($stream) {
-          $this->stream = $stream;
+      public function send() {
+        try {
+          ($this->stream)();
         }
-
-        public function send() {
-          foreach ($this->stream as $event) {
-            if (isset($event['contentBlockDelta']['delta']['text'])) {
-              echo $event['contentBlockDelta']['delta']['text'];
-              @ob_flush();
-              @flush();
-            }
-          }
+        catch (\Exception $e) {
+          watchdog(
+            'ai_provider_aws_bedrock',
+            'Streaming error: @error',
+            ['@error' => $e->getMessage()],
+            WATCHDOG_ERROR
+          );
+          throw $e;
         }
+      }
 
-      };
-    }
-    catch (\Exception $e) {
-      watchdog(
-        'ai_provider_aws_bedrock',
-        'Streaming error: @error',
-        ['@error' => $e->getMessage()],
-        WATCHDOG_ERROR
-      );
-      throw $e;
-    }
+    };
   }
 
   /**
@@ -1277,8 +1430,7 @@ class AIBedrockAdapter extends AIAdapterBase {
         }
       }
 
-      $client = $this->getRuntimeClient();
-      $response = $this->converse($client, $model, $payload);
+      $response = $this->converse($model, $payload);
 
       $content = '';
       $tool_calls = [];
@@ -1340,7 +1492,7 @@ class AIBedrockAdapter extends AIAdapterBase {
         'finish_reason' => $finish_reason,
         'content'       => trim($content),
         'tool_calls'    => $tool_calls,
-        'raw'           => (array) $response,
+        'raw'           => $response,
       ];
     }
     catch (\Exception $e) {

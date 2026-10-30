@@ -19,6 +19,33 @@ function ai_provider_aws_bedrock_uninstall() {
  * Implements hook_requirements().
  */
 function ai_provider_aws_bedrock_requirements($phase) {
-  if (!module_load_install('ai_upgrade')) { return []; }
-  return ai_upgrade_module_requirements($phase, 'ai_provider_aws_bedrock');
+  $requirements = [];
+  if ($phase == 'runtime' && !module_exists('aws_connect')) {
+    $t = get_t();
+    $requirements['ai_provider_aws_bedrock_connection'] = [
+      'title' => $t('AWS Bedrock connection'),
+      'value' => $t('Bundled AWS SDK for PHP (deprecated)'),
+      'description' => $t('AI Provider AWS Bedrock now connects to AWS through the <a href="@url">AWS Connect</a> module. The bundled AWS SDK for PHP is deprecated and will be removed in the next major release, which requires AWS Connect. Add and enable AWS Connect now; no configuration is needed.', ['@url' => 'https://backdropcms.org/project/aws_connect']),
+      'severity' => REQUIREMENT_WARNING,
+    ];
+  }
+  if (module_load_install('ai_upgrade')) {
+    $requirements += ai_upgrade_module_requirements($phase, 'ai_provider_aws_bedrock');
+  }
+  return $requirements;
+}
+
+/**
+ * Enable the AWS Connect module, if present, to replace the bundled AWS SDK.
+ */
+function ai_provider_aws_bedrock_update_1000() {
+  if (module_exists('aws_connect')) {
+    return;
+  }
+  // AWS Connect may not be on disk yet; the bundled SDK keeps working until
+  // it is, and the status report warns about the deprecation.
+  if (module_enable(array('aws_connect'))) {
+    return t('Enabled the AWS Connect module.');
+  }
+  return t('AWS Connect was not found, so AWS Bedrock still uses the deprecated bundled AWS SDK. Add AWS Connect before the next major release, which requires it.');
 }

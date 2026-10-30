@@ -5,7 +5,7 @@ AWS Bedrock AI models provider for the Backdrop CMS AI module.
 ## Installation
 
 - Install this module using the official [Backdrop CMS instructions](https://backdropcms.org/user-guide/modules).
-- **Composer Not Required**: This module packages a bundled, isolated AWS SDK under `vendor/`. Sites without Composer or Composer Manager can use AWS Bedrock out of the box. If Composer Manager or a global AWS SDK is already active on your site, this module automatically reuses the existing autoloader.
+- **Composer Not Required**: Requests are signed and sent by the AWS Connect module (Signature Version 4 over curl). Until AWS Connect is enabled, the module falls back to the bundled AWS SDK under `vendor/`; that fallback is deprecated and will be removed in the next major release, which requires AWS Connect.
 
 ## Issues
 
