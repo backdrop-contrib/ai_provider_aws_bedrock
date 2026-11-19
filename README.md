@@ -1,11 +1,12 @@
 # AI Provider AWS Bedrock
 
-AWS Bedrock AI models provider for the Backdrop CMS AI module.
+Use foundation models hosted in Amazon Bedrock from Backdrop. Match a model to the job, such as drafting text, analyzing an image, or creating embeddings for semantic search.
 
 ## Installation
 
-- Install this module using the official [Backdrop CMS instructions](https://backdropcms.org/user-guide/modules).
-- **Composer Not Required**: This module packages a bundled, isolated AWS SDK under `vendor/`. Sites without Composer or Composer Manager can use AWS Bedrock out of the box. If Composer Manager or a global AWS SDK is already active on your site, this module automatically reuses the existing autoloader.
+Install and enable this module with AI and Key. [Backdrop module installation guide](https://backdropcms.org/user-guide/modules)
+
+Store your service credentials using the Key module. Choose the provider in **Configuration → AI → Settings → Providers**. The module includes the AWS SDK and needs no Composer step. [Setup and troubleshooting](https://github.com/backdrop-contrib/ai_provider_aws_bedrock/wiki)
 
 ## Issues
 
